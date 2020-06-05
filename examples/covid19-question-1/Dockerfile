@@ -17,7 +17,8 @@ LABEL references=""
 RUN pip install pandas \
   numpy \
   sklearn \
-  datetime
+  datetime \
+  Cython
 
 # Move to the app folder
 RUN mkdir /app
@@ -26,6 +27,10 @@ WORKDIR /app
 # Copy our python program for training and inference
 COPY src/infer.py .
 
+# Build Cython extension module
+COPY src/extension.pyx .
+COPY src/setup.py .
+RUN python setup.py build_ext --inplace
 
 # Copy Bash scripts expected by the IT infrastructure of the EHR DREAM Challenge
 COPY infer.sh .
