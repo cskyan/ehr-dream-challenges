@@ -18,7 +18,8 @@ RUN pip install pandas \
   numpy \
   sklearn \
   datetime \
-  Cython
+  Cython \
+  "dask[complete]"
 
 # Move to the app folder
 RUN mkdir /app
