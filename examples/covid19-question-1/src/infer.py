@@ -106,6 +106,34 @@ def scatter_features(df, group_by, feature_col, dictionary={}, aggregate_funcs=N
         data[ridx, [col_idx[j] for j in df[feature_col].apply(lambda x: (x, col)).values]] = df[col]
     return pd.DataFrame(data, index=rows, columns=['_'.join([dictionary.setdefault(str(prefix), '_'.join([feature_col, str(prefix)])).replace(' ', '_'), col]) for prefix, col in cols])
 
+def _func_gen_flatcol(col, idx):
+    def f(x):
+        return idx[(x, col)]
+    return f
+
+def scatter_features_dask(df, group_by, feature_col, dictionary={}, aggregate_funcs=None, selected_feats=[]):
+    if len(selected_feats) > 0: df = df.loc[df[feature_col].isin(selected_feats)]
+    key_cols = (group_by + [feature_col]) if type(group_by) is list else [group_by, feature_col]
+    other_cols = [col for col in df.columns if col not in key_cols]
+    if len(other_cols) == 0:
+        other_cols = ['occurrence']
+        df = df.reset_index().set_index('index')
+        df['occurrence'] = dd.from_array(np.ones(len(df), dtype='int'))
+    df[feature_col] = df[feature_col].fillna(df[feature_col].value_counts().index.compute()[0])
+    rows = df[group_by].drop_duplicates().dropna().compute()
+    df = df.loc[df[group_by].isin(rows)]
+    prefixs = df[feature_col].drop_duplicates().compute()
+    cols = [(prefix, col) for prefix in prefixs for col in other_cols]
+    row_idx, col_idx = dict(zip(rows, range(len(rows)))), dict(zip(cols, range(len(cols))))
+    ridx = [row_idx[i] for i in df[group_by].values.compute()]
+    data = np.ones((len(rows),len(cols))) * np.nan
+    for col in other_cols:
+        cidx = df[feature_col].compute().map(_func_gen_flatcol(col, col_idx)).values
+        t0 = time.time()
+        data[ridx, cidx] = df[col].compute()
+        t0 = time.time()
+    return pd.DataFrame(data, index=rows, columns=['_'.join([dictionary.setdefault(str(prefix), '_'.join([feature_col, str(prefix)])).replace(' ', '_'), col]) for prefix, col in cols])
+
 def _agg_feat(df, group_by, feature_col, other_cols, dictionary={}, aggregate_funcs=None, pid=0):
     data = []
     for gid, grp in df.groupby(group_by):
@@ -177,14 +205,14 @@ pre_selected_feats = dict(measurement=list(map(str, [3020891, 3027018, 3012888, 
 
 print('Generating features...', flush=True)
 t0 = time.time()
-measurement_features = scatter_features(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('measurement', []))
+measurement_features = scatter_features_dask(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('measurement', []))
 measurement_features = measurement_features[filter_cols(measurement_features)]
 print('Measurement features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
 # condition_all = pd.merge(condition, condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
 # condition_era_features = era_features(condition_all.condition_era_start_date, condition_all.condition_era_end_date, focus_date=NOW, feature_name='condition')
 # condition_df = pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
-condition_features = scatter_features(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('condition', []))
+condition_features = scatter_features_dask(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('condition', []))
 condition_features = condition_features[filter_cols(condition_features)]
 print('Condition features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
