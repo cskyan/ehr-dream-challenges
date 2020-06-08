@@ -11,6 +11,7 @@ from sklearn.mixture import GaussianMixture
 
 DATA_PATH = '/data'
 NOW = dt.datetime.now()
+USE_DASK = True
 
 
 def split_1d(task_num, split_num=None, task_size=None, split_size=None, ret_idx=False):
@@ -139,7 +140,7 @@ def scatter_features_dask(df, group_by, feature_col, dictionary={}, aggregate_fu
         t0 = time.time()
     return pd.DataFrame(data, index=rows, columns=['_'.join([dictionary.setdefault(str(prefix), '_'.join([feature_col, str(prefix)])).replace(' ', '_'), col]) for prefix, col in cols])
 
-def _agg_feat(df, group_by, feature_col, other_cols, dictionary={}, aggregate_funcs=None, pid=0):
+def _scatter_feat(df, group_by, feature_col, other_cols, dictionary={}, aggregate_funcs=None, pid=0):
     data = []
     for gid, grp in df.groupby(group_by):
         grp = grp.groupby(feature_col).agg(np.mean if aggregate_funcs is None else aggregate_funcs).reset_index()
@@ -154,12 +155,12 @@ def scatter_features_par(df, group_by, feature_col, dictionary={}, aggregate_fun
     key_cols = (group_by + [feature_col]) if type(group_by) is list else [group_by, feature_col]
     other_cols = [col for col in df.columns if col not in key_cols]
     if n_jobs==1:
-        data = _agg_feat(df, group_by, feature_col, other_cols, dictionary=dictionary, aggregate_funcs=aggregate_funcs)
+        data = _scatter_feat(df, group_by, feature_col, other_cols, dictionary=dictionary, aggregate_funcs=aggregate_funcs)
     else:
         indices = np.unique(df[group_by].values)
         task_bnd = split_1d(len(indices), split_num=n_jobs, ret_idx=True)
         df = df.set_index(group_by)
-        all_data = run_pool(_agg_feat, n_jobs=n_jobs, dist_param=['df', 'pid'], df=[df.loc[indices[task_bnd[i]:task_bnd[i+1]]].reset_index() for i in range(n_jobs)], pid=range(n_jobs), group_by=group_by, feature_col=feature_col, other_cols=other_cols, dictionary=dictionary, aggregate_funcs=aggregate_funcs)
+        all_data = run_pool(_scatter_feat, n_jobs=n_jobs, dist_param=['df', 'pid'], df=[df.loc[indices[task_bnd[i]:task_bnd[i+1]]].reset_index() for i in range(n_jobs)], pid=range(n_jobs), group_by=group_by, feature_col=feature_col, other_cols=other_cols, dictionary=dictionary, aggregate_funcs=aggregate_funcs)
         df = df.reset_index()
         data = itertools.chain.from_iterable(all_data)
     return pd.concat(data, axis=0).loc[df[group_by].drop_duplicates().values]
@@ -176,21 +177,26 @@ def encode_cat_features(df, cat_cols, inplace=False):
     return df.replace(encoding, inplace=inplace)
 
 
+if USE_DASK:
+    from dask.distributed import Client
+    client = Client(n_workers=1, threads_per_worker=multiprocessing.cpu_count(), memory_limit='10GB', processes=False, dashboard_address=None)
+    scatter_features = scatter_features_dask
+
 print('Loading measurement.csv ...', flush=True)
 t0 = time.time()
-measurement = dd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['measurement_concept_id','value_as_number','person_id'])
+measurement = dd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['measurement_concept_id','value_as_number','person_id']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['measurement_concept_id','value_as_number','person_id'])
 measurement = measurement.dropna(subset = ['measurement_concept_id'])
 measurement = measurement.astype({"measurement_concept_id": str})
 print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading condition.csv ...', flush=True)
 t0 = time.time()
-condition = dd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['condition_concept_id','person_id'])
+condition = dd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['condition_concept_id','person_id']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['condition_concept_id','person_id'])
 condition = condition.dropna(subset = ['condition_concept_id'])
 condition = condition.astype({"condition_concept_id": str})
 print('Data load time: %0.3fs' % (time.time() - t0))
 # print('Loading condition_era.csv ...', flush=True)
 # t0 = time.time()
-# condition_era = dd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True)
+# condition_era = dd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True)
 # print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading person.csv ...', flush=True)
 t0 = time.time()
@@ -202,7 +208,7 @@ location = pd.read_csv(os.path.join(DATA_PATH, 'location.csv'))
 print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading data_dictionary.csv ...', flush=True)
 t0 = time.time()
-data_dictionary = dd.read_csv(os.path.join(DATA_PATH, 'data_dictionary.csv')).set_index('concept_id')
+data_dictionary = dd.read_csv(os.path.join(DATA_PATH, 'data_dictionary.csv')).set_index('concept_id') if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'data_dictionary.csv'), index_col='concept_id')
 dictionary = dict([(str(k), v) for k, v in data_dictionary.concept_name.iteritems()])
 print('Data load time: %0.3fs' % (time.time() - t0))
 
@@ -210,14 +216,14 @@ pre_selected_feats = dict(measurement=list(map(str, [3020891, 3027018, 3012888, 
 
 print('Generating features...', flush=True)
 t0 = time.time()
-measurement_features = scatter_features_dask(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('measurement', []))
+measurement_features = scatter_features(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('measurement', []))
 measurement_features = measurement_features[filter_cols(measurement_features)]
 print('Measurement features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
 # condition_all = pd.merge(condition, condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
 # condition_era_features = era_features(condition_all.condition_era_start_date, condition_all.condition_era_end_date, focus_date=NOW, feature_name='condition')
 # condition_df = pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
-condition_features = scatter_features_dask(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('condition', []))
+condition_features = scatter_features(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('condition', []))
 condition_features = condition_features[filter_cols(condition_features)]
 print('Condition features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
@@ -228,6 +234,7 @@ person_features = person_df[filter_cols(person_df)].set_index('person_id')
 encode_cat_features(person_features, ['gender_concept_id', 'race_concept_id', 'ethnicity_concept_id', 'gender_source_value', 'race_source_concept_id', 'ethnicity_source_concept_id'], inplace=True)
 encode_cat_features(person_features, 'location_id', inplace=True)
 print('Person features cost time: %0.3fs' % (time.time() - t0))
+if USE_DASK: client.close()
 
 print('Preparing data...', flush=True)
 t0 = time.time()
