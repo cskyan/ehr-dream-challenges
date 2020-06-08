@@ -108,7 +108,12 @@ def scatter_features(df, group_by, feature_col, dictionary={}, aggregate_funcs=N
 
 def _func_gen_flatcol(col, idx):
     def f(x):
-        return idx[(x, col)]
+        return idx[(x, col)] if x != 'foo' else -1
+    return f
+
+def _func_gen_flatcol_part(fcol, col, idx):
+    def f(df):
+        return df[fcol].apply(_func_gen_flatcol(col, idx))
     return f
 
 def scatter_features_dask(df, group_by, feature_col, dictionary={}, aggregate_funcs=None, selected_feats=[]):
@@ -118,17 +123,17 @@ def scatter_features_dask(df, group_by, feature_col, dictionary={}, aggregate_fu
     if len(other_cols) == 0:
         other_cols = ['occurrence']
         df = df.reset_index().set_index('index')
-        df['occurrence'] = dd.from_array(np.ones(len(df), dtype='int'))
+        df = df.map_partitions(lambda subdf: subdf.assign(occurrence=np.ones(len(subdf), dtype='int8')))
     df[feature_col] = df[feature_col].fillna(df[feature_col].value_counts().index.compute()[0])
     rows = df[group_by].drop_duplicates().dropna().compute()
     df = df.loc[df[group_by].isin(rows)]
     prefixs = df[feature_col].drop_duplicates().compute()
     cols = [(prefix, col) for prefix in prefixs for col in other_cols]
     row_idx, col_idx = dict(zip(rows, range(len(rows)))), dict(zip(cols, range(len(cols))))
-    ridx = [row_idx[i] for i in df[group_by].values.compute()]
+    ridx = df.map_partitions(lambda subdf: subdf[group_by].apply(lambda x: row_idx[x])).values.compute()
     data = np.ones((len(rows),len(cols))) * np.nan
     for col in other_cols:
-        cidx = df[feature_col].compute().map(_func_gen_flatcol(col, col_idx)).values
+        cidx = df.map_partitions(_func_gen_flatcol_part(feature_col, col, col_idx)).values
         t0 = time.time()
         data[ridx, cidx] = df[col].compute()
         t0 = time.time()
