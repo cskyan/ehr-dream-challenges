@@ -4,6 +4,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
+from sklearn import preprocessing
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.mixture import GaussianMixture
 
@@ -62,7 +63,7 @@ def fix_duplicates(X, suffix=[]):
     return [x if len(unique_X[x])==1 else x+'_%s'%unique_X[x].index(i) for i, x in enumerate(X)] if len(suffix) != len(X) else [x if len(unique_X[x])==1 else x+'_%s'%suffix[i] for i, x in enumerate(X)]
 
 def filter_cols(df, force=[], keywords=[]):
-    return [col for col in df.columns if col not in force and not any([k in col for k in keywords]) and df[col].value_counts().shape[0] > 1]
+    return [col for col in df.columns if col not in force and not any([k in col for k in keywords]) and not all(df[col].isnull()) and df[col].value_counts().shape[0] > 1]
 
 def normalize(a, ord=1):
     norm=np.linalg.norm(a, ord=ord)
@@ -72,10 +73,10 @@ def normalize(a, ord=1):
 get_delta_days = lambda x: x.days + x.seconds / 86400
 
 def era_features(start_dates, end_dates, focus_date=dt.datetime.now(), feature_name=''):
-    start2focus = start_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_start2focus_timedelta') if feature_name else 'start2focus_timedelta')
-    end2focus = end_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_end2focus_timedelta') if feature_name else 'end2focus_timedelta')
-    start2end = (end_dates - start_dates).apply(get_delta_days).rename((feature_name+'_start2end_timedelta') if feature_name else 'start2end_timedelta')
-    return pd.concat([start2focus, end2focus, start2end], axis=1)
+    start2focus = start_dates.map_partitions(lambda subdf: subdf.apply(lambda x: get_delta_days(focus_date - x))).rename((feature_name+'_start2focus_timedelta') if feature_name else 'start2focus_timedelta') if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else start_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_start2focus_timedelta') if feature_name else 'start2focus_timedelta')
+    end2focus = end_dates.map_partitions(lambda subdf: subdf.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_end2focus_timedelta') if feature_name else 'end2focus_timedelta')) if type(end_dates) is dd.Series or type(start_dates) is dd.DataFrame else end_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_end2focus_timedelta') if feature_name else 'end2focus_timedelta')
+    start2end = (end_dates - start_dates).map_partitions(lambda subdf: subdf.apply(get_delta_days).rename((feature_name+'_start2end_timedelta') if feature_name else 'start2end_timedelta')) if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else (end_dates - start_dates).apply(get_delta_days).rename((feature_name+'_start2end_timedelta') if feature_name else 'start2end_timedelta')
+    return dd.concat([start2focus, end2focus, start2end], axis=1).compute() if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else pd.concat([start2focus, end2focus, start2end], axis=1)
 
 def scatter_features_orig(df, group_by, feature_col, dictionary={}, aggregate_funcs=None):
     key_cols = (group_by + [feature_col]) if type(group_by) is list else [group_by, feature_col]
@@ -101,10 +102,15 @@ def scatter_features(df, group_by, feature_col, dictionary={}, aggregate_funcs=N
     rows = df[group_by].drop_duplicates().values
     cols = [(prefix, col) for prefix in df[feature_col].drop_duplicates().values for col in other_cols]
     row_idx, col_idx = dict(zip(rows, range(len(rows)))), dict(zip(cols, range(len(cols))))
-    data = np.ones((len(rows),len(cols))) * np.nan
+    data = np.ones((len(rows),len(cols))) * (0 if aggregate_funcs=='sum' else np.nan)
     ridx = [row_idx[i] for i in df[group_by].values]
     for col in other_cols:
-        data[ridx, [col_idx[j] for j in df[feature_col].apply(lambda x: (x, col)).values]] = df[col]
+        if aggregate_funcs is None:
+            data[ridx, [col_idx[j] for j in df[feature_col].apply(lambda x: (x, col)).values]] = df[col]
+        else:
+            cidx = [col_idx[j] for j in df[feature_col].apply(lambda x: (x, col)).values]
+            # data[ridx, cidx][np.isnan(data[ridx, cidx])] = 0
+            data[ridx, cidx] += df[col].compute()
     return pd.DataFrame(data, index=rows, columns=['_'.join([dictionary.setdefault(str(prefix), '_'.join([feature_col, str(prefix)])).replace(' ', '_'), col]) for prefix, col in cols])
 
 def _func_gen_flatcol(col, idx):
@@ -132,12 +138,14 @@ def scatter_features_dask(df, group_by, feature_col, dictionary={}, aggregate_fu
     cols = [(prefix, col) for prefix in prefixs for col in other_cols]
     row_idx, col_idx = dict(zip(rows, range(len(rows)))), dict(zip(cols, range(len(cols))))
     ridx = df.map_partitions(lambda subdf: subdf[group_by].apply(lambda x: row_idx[x])).values.compute()
-    data = np.ones((len(rows),len(cols))) * np.nan
+    data = np.ones((len(rows),len(cols))) * (0 if aggregate_funcs=='sum' else np.nan)
     for col in other_cols:
         cidx = df.map_partitions(_func_gen_flatcol_part(feature_col, col, col_idx)).values
-        t0 = time.time()
-        data[ridx, cidx] = df[col].compute()
-        t0 = time.time()
+        if aggregate_funcs is None:
+            data[ridx, cidx] = df[col].compute()
+        else:
+            # data[ridx, cidx][np.isnan(data[ridx, cidx])] = 0
+            data[ridx, cidx] += df[col].compute()
     return pd.DataFrame(data, index=rows, columns=['_'.join([dictionary.setdefault(str(prefix), '_'.join([feature_col, str(prefix)])).replace(' ', '_'), col]) for prefix, col in cols])
 
 def _scatter_feat(df, group_by, feature_col, other_cols, dictionary={}, aggregate_funcs=None, pid=0):
@@ -169,12 +177,28 @@ def encode_cat_features(df, cat_cols, inplace=False):
     encoding = {}
     if type(cat_cols) is list:
         for col in cat_cols:
+            if col not in df.columns or all(df[col].isnull()): continue
             df[col].fillna(df[col][df[col].notnull()].value_counts().values.argmax() if df[col].dtypes==object else df[col][df[col].notnull()].median(), inplace=True)
-            encoding[col] = dict([(v, i) for i, v in enumerate(np.unique(df[col]))])
+            # encoding[col] = dict([(v, i) for i, v in enumerate(np.unique(df[col]))])
+            try:
+                df[col] = preprocessing.LabelEncoder().fit_transform(df[col])
+            except Exception as e:
+                print('Failed to convert column `%s` to category values!' % col)
+                print(e)
+                df.drop(col, axis=1, inplace=inplace)
+        # df = df.replace(encoding, inplace=inplace)
     elif type(cat_cols) is str:
+        if cat_cols not in df.columns or all(df[cat_cols].isnull()): return df
         df[cat_cols].fillna(df[cat_cols][df[cat_cols].notnull()].value_counts().values.argmax() if df[cat_cols].dtypes==object else df[cat_cols][df[cat_cols].notnull()].median(), inplace=True)
-        encoding = dict([(v, i) for i, v in enumerate(np.unique(df[cat_cols]))])
-    return df.replace(encoding, inplace=inplace)
+        try:
+            # encoding = dict([(v, i) for i, v in enumerate(np.unique(df[cat_cols]))])
+            # df = df.replace(encoding, inplace=inplace)
+            df[cat_cols] = preprocessing.LabelEncoder().fit_transform(df[cat_cols])
+        except Exception as e:
+            print('Failed to convert column `%s` to category values!' % cat_cols)
+            print(e)
+            df.drop(cat_cols, axis=1, inplace=inplace)
+    return df
 
 
 if USE_DASK:
@@ -184,13 +208,13 @@ if USE_DASK:
 
 print('Loading measurement.csv ...', flush=True)
 t0 = time.time()
-measurement = dd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['measurement_concept_id','value_as_number','person_id']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['measurement_concept_id','value_as_number','person_id'])
+measurement = dd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['person_id', 'measurement_concept_id', 'value_as_number']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'measurement.csv'), usecols=['person_id', 'measurement_concept_id', 'value_as_number'])
 measurement = measurement.dropna(subset = ['measurement_concept_id'])
 measurement = measurement.astype({"measurement_concept_id": str})
 print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading condition.csv ...', flush=True)
 t0 = time.time()
-condition = dd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['condition_concept_id','person_id']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['condition_concept_id','person_id'])
+condition = dd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['person_id', 'condition_concept_id']) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), usecols=['person_id', 'condition_concept_id'])
 condition = condition.dropna(subset = ['condition_concept_id'])
 condition = condition.astype({"condition_concept_id": str})
 print('Data load time: %0.3fs' % (time.time() - t0))
@@ -200,11 +224,11 @@ print('Data load time: %0.3fs' % (time.time() - t0))
 # print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading person.csv ...', flush=True)
 t0 = time.time()
-person = pd.read_csv(os.path.join(DATA_PATH, 'person.csv'), parse_dates=['birth_datetime'], infer_datetime_format=True)
+person = pd.read_csv(os.path.join(DATA_PATH, 'person.csv'), parse_dates=['birth_datetime'], infer_datetime_format=True, usecols=['person_id', 'birth_datetime', 'gender_concept_id', 'race_concept_id', 'ethnicity_concept_id', 'location_id'], dtype={'location_id':str})
 print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading location.csv ...', flush=True)
 t0 = time.time()
-location = pd.read_csv(os.path.join(DATA_PATH, 'location.csv'))
+location = pd.read_csv(os.path.join(DATA_PATH, 'location.csv'), usecols=['location_id', 'zip', 'state'], dtype={'location_id':str, 'zip':str, 'state':str})
 print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading data_dictionary.csv ...', flush=True)
 t0 = time.time()
@@ -216,23 +240,24 @@ pre_selected_feats = dict(measurement=list(map(str, [3020891, 3027018, 3012888, 
 
 print('Generating features...', flush=True)
 t0 = time.time()
-measurement_features = scatter_features(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('measurement', []))
+measurement_features = scatter_features(measurement, 'person_id', 'measurement_concept_id', dictionary=dictionary, aggregate_funcs=None, selected_feats=pre_selected_feats.setdefault('measurement', []))
 measurement_features = measurement_features[filter_cols(measurement_features)]
+print('Measurement features (%i): %.200s' % (len(measurement_features.columns), str(measurement_features.columns.tolist())))
 print('Measurement features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
-# condition_all = pd.merge(condition, condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
+# condition_all = condition.merge(condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
 # condition_era_features = era_features(condition_all.condition_era_start_date, condition_all.condition_era_end_date, focus_date=NOW, feature_name='condition')
-# condition_df = pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
-condition_features = scatter_features(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, selected_feats=pre_selected_feats.setdefault('condition', []))
+# condition_df = dd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1) if USE_DASK else pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
+condition_features = scatter_features(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, aggregate_funcs='sum', selected_feats=pre_selected_feats.setdefault('condition', []))
 condition_features = condition_features[filter_cols(condition_features)]
+print('Condition features (%i): %.200s' % (len(condition_features.columns), str(condition_features.columns.tolist())))
 print('Condition features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
 person_birthdate = person.birth_datetime.fillna(dt.datetime.fromtimestamp(person.birth_datetime[person.birth_datetime.notnull()].apply(dt.datetime.timestamp).median())).apply(lambda x: get_delta_days(NOW - x))
 person_df = pd.concat([person[filter_cols(person, force=['year_of_birth', 'month_of_birth', 'day_of_birth'], keywords=['date'])], person_birthdate.to_frame()], axis=1)
 person_df = pd.merge(person_df, location, how='left', on='location_id')
 person_features = person_df[filter_cols(person_df)].set_index('person_id')
-encode_cat_features(person_features, ['gender_concept_id', 'race_concept_id', 'ethnicity_concept_id', 'gender_source_value', 'race_source_concept_id', 'ethnicity_source_concept_id'], inplace=True)
-encode_cat_features(person_features, 'location_id', inplace=True)
+encode_cat_features(person_features, ['gender_concept_id', 'race_concept_id', 'ethnicity_concept_id', 'location_id', 'zip', 'state'], inplace=True)
 print('Person features cost time: %0.3fs' % (time.time() - t0))
 if USE_DASK: client.close()
 
@@ -247,10 +272,17 @@ processed_cols = []
 condition_value_cols = [col for col in X.columns if col.endswith('condition_occurrence_count')]
 processed_cols.extend(condition_value_cols)
 for col in condition_value_cols: X[col].fillna(0, inplace=True)
-for col in set(X.columns)-set(processed_cols): X[col].fillna(X[col][X[col].notnull()].median(), inplace=True)
+for col in set(X.columns)-set(processed_cols):
+    try:
+        X[col].fillna(X[col][X[col].notnull()].median(), inplace=True)
+    except Exception as e:
+        print('Failed to fill empty values in column `%s`!' % col)
+        print(e)
+        X.drop(col, axis=1, inplace=True)
 print('Cost time: %0.3fs' % (time.time() - t0))
 
 print('Fitting into the model...', flush=True)
+print('Input data size: %s' % str(X.shape))
 t0 = time.time()
 # K-Means
 clt_model = MiniBatchKMeans(n_clusters=2, random_state=0)
