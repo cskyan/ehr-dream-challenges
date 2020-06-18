@@ -63,7 +63,7 @@ def fix_duplicates(X, suffix=[]):
     return [x if len(unique_X[x])==1 else x+'_%s'%unique_X[x].index(i) for i, x in enumerate(X)] if len(suffix) != len(X) else [x if len(unique_X[x])==1 else x+'_%s'%suffix[i] for i, x in enumerate(X)]
 
 def filter_cols(df, force=[], keywords=[]):
-    return [col for col in df.columns if col not in force and not any([k in col for k in keywords]) and not all(df[col].isnull()) and df[col].value_counts().shape[0] > 1]
+    return [col for col in df.columns if col not in force and not any([k in col for k in keywords])] if type(df) is dd.DataFrame else [col for col in df.columns if col not in force and not any([k in col for k in keywords]) and not all(df[col].isnull()) and df[col].value_counts().shape[0] > 1]
 
 def normalize(a, ord=1):
     norm=np.linalg.norm(a, ord=ord)
@@ -76,7 +76,7 @@ def era_features(start_dates, end_dates, focus_date=dt.datetime.now(), feature_n
     start2focus = start_dates.map_partitions(lambda subdf: subdf.apply(lambda x: get_delta_days(focus_date - x))).rename((feature_name+'_start2focus_timedelta') if feature_name else 'start2focus_timedelta') if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else start_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_start2focus_timedelta') if feature_name else 'start2focus_timedelta')
     end2focus = end_dates.map_partitions(lambda subdf: subdf.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_end2focus_timedelta') if feature_name else 'end2focus_timedelta')) if type(end_dates) is dd.Series or type(start_dates) is dd.DataFrame else end_dates.apply(lambda x: get_delta_days(focus_date - x)).rename((feature_name+'_end2focus_timedelta') if feature_name else 'end2focus_timedelta')
     start2end = (end_dates - start_dates).map_partitions(lambda subdf: subdf.apply(get_delta_days).rename((feature_name+'_start2end_timedelta') if feature_name else 'start2end_timedelta')) if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else (end_dates - start_dates).apply(get_delta_days).rename((feature_name+'_start2end_timedelta') if feature_name else 'start2end_timedelta')
-    return dd.concat([start2focus, end2focus, start2end], axis=1).compute() if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else pd.concat([start2focus, end2focus, start2end], axis=1)
+    return dd.concat([start2focus, end2focus, start2end], axis=1) if type(start_dates) is dd.Series or type(start_dates) is dd.DataFrame else pd.concat([start2focus, end2focus, start2end], axis=1)
 
 def scatter_features_orig(df, group_by, feature_col, dictionary={}, aggregate_funcs=None):
     key_cols = (group_by + [feature_col]) if type(group_by) is list else [group_by, feature_col]
@@ -218,10 +218,10 @@ condition = dd.read_csv(os.path.join(DATA_PATH, "condition_occurrence.csv"), use
 condition = condition.dropna(subset = ['condition_concept_id'])
 condition = condition.astype({"condition_concept_id": str})
 print('Data load time: %0.3fs' % (time.time() - t0))
-# print('Loading condition_era.csv ...', flush=True)
-# t0 = time.time()
-# condition_era = dd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True)
-# print('Data load time: %0.3fs' % (time.time() - t0))
+print('Loading condition_era.csv ...', flush=True)
+t0 = time.time()
+condition_era = dd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True) if USE_DASK else pd.read_csv(os.path.join(DATA_PATH, 'condition_era.csv'), dtype={'condition_concept_id':object, 'condition_era_id':int}, parse_dates=['condition_era_start_date', 'condition_era_end_date'], infer_datetime_format=True)
+print('Data load time: %0.3fs' % (time.time() - t0))
 print('Loading person.csv ...', flush=True)
 t0 = time.time()
 person = pd.read_csv(os.path.join(DATA_PATH, 'person.csv'), parse_dates=['birth_datetime'], infer_datetime_format=True, usecols=['person_id', 'birth_datetime', 'gender_concept_id', 'race_concept_id', 'ethnicity_concept_id', 'location_id'], dtype={'location_id':str})
@@ -245,10 +245,10 @@ measurement_features = measurement_features[filter_cols(measurement_features)]
 print('Measurement features (%i): %.200s' % (len(measurement_features.columns), str(measurement_features.columns.tolist())))
 print('Measurement features cost time: %0.3fs' % (time.time() - t0))
 t0 = time.time()
-# condition_all = condition.merge(condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
-# condition_era_features = era_features(condition_all.condition_era_start_date, condition_all.condition_era_end_date, focus_date=NOW, feature_name='condition')
-# condition_df = dd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1) if USE_DASK else pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
-condition_features = scatter_features(condition, 'person_id', 'condition_concept_id', dictionary=dictionary, aggregate_funcs='sum', selected_feats=pre_selected_feats.setdefault('condition', []))
+condition_all = condition.merge(condition_era, how='outer', on=['person_id', 'condition_concept_id']).drop_duplicates()
+condition_era_features = era_features(condition_all.condition_era_start_date, condition_all.condition_era_end_date, focus_date=NOW, feature_name='condition')
+condition_df = dd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1) if USE_DASK else pd.concat([condition_all[filter_cols(condition_all, force=['condition_era_id'], keywords=['date'])], condition_era_features], axis=1)
+condition_features = scatter_features(condition_df, 'person_id', 'condition_concept_id', dictionary=dictionary, aggregate_funcs='sum', selected_feats=pre_selected_feats.setdefault('condition', []))
 condition_features = condition_features[filter_cols(condition_features)]
 print('Condition features (%i): %.200s' % (len(condition_features.columns), str(condition_features.columns.tolist())))
 print('Condition features cost time: %0.3fs' % (time.time() - t0))
